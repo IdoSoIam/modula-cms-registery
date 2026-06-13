@@ -15,6 +15,17 @@ type ReleaseRegistryMeta = {
   changelogMarkdown?: string
 }
 
+type TemplateAssetReference = {
+  id?: string
+  downloadUrl?: string
+  publicUrl?: string
+  sourceUrl?: string
+}
+
+type TemplateSnapshot = {
+  assetManifest?: TemplateAssetReference[]
+}
+
 function json(data: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(data), {
     ...init,
@@ -100,6 +111,84 @@ function baseUrl(env: Env, request: Request) {
   return (env.PUBLIC_BASE_URL || new URL(request.url).origin).replace(/\/$/, '')
 }
 
+function templateAssetPublicUrl(env: Env, request: Request, id: string) {
+  return `${baseUrl(env, request)}/public/template-assets/${encodeURIComponent(id)}`
+}
+
+function templateAssetPublicUrlFromReference(env: Env, request: Request, asset: TemplateAssetReference) {
+  const explicitPublicUrl = asset.publicUrl?.trim()
+  if (explicitPublicUrl) return explicitPublicUrl
+
+  const assetId = asset.id?.trim()
+  if (assetId) {
+    return templateAssetPublicUrl(env, request, assetId)
+  }
+
+  const downloadUrl = asset.downloadUrl?.trim() || ''
+  const match = downloadUrl.match(/\/v1\/template-assets\/([^/]+)\/download$/)
+  if (match) {
+    return templateAssetPublicUrl(env, request, decodeURIComponent(match[1]!))
+  }
+
+  return ''
+}
+
+async function resolveTemplateAssetBySourceUrl(
+  env: Env,
+  sourceUrl: string
+) {
+  const normalized = (sourceUrl || '').trim()
+  if (!normalized) return null
+
+  const row = await env.DB.prepare(
+    'SELECT id, source_url FROM template_assets WHERE source_url = ? ORDER BY created_at DESC LIMIT 1'
+  ).bind(normalized).first<any>()
+
+  if (!row?.id) {
+    return null
+  }
+
+  return {
+    id: row.id as string,
+    sourceUrl: row.source_url as string
+  }
+}
+
+async function normalizeTemplatePreviewImage(
+  env: Env,
+  request: Request,
+  previewImage: string | null | undefined,
+  snapshot?: TemplateSnapshot | null
+) {
+  const value = (previewImage || '').trim()
+  if (!value) return ''
+
+  const legacyMatch = value.match(/\/v1\/template-assets\/([^/]+)\/download$/)
+  if (legacyMatch) {
+    return templateAssetPublicUrl(env, request, decodeURIComponent(legacyMatch[1]!))
+  }
+
+  const normalizedValue = value.replace(/^https?:\/\/[^/]+/i, '')
+  if (normalizedValue.startsWith('/site-templates/')) {
+    const asset = (snapshot?.assetManifest || []).find((entry) => {
+      const sourceUrl = (entry.sourceUrl || '').trim()
+      return sourceUrl === normalizedValue || sourceUrl.endsWith(normalizedValue)
+    })
+
+    const publicUrl = asset ? templateAssetPublicUrlFromReference(env, request, asset) : ''
+    if (publicUrl) {
+      return publicUrl
+    }
+
+    const resolvedAsset = await resolveTemplateAssetBySourceUrl(env, normalizedValue)
+    if (resolvedAsset?.id) {
+      return templateAssetPublicUrl(env, request, resolvedAsset.id)
+    }
+  }
+
+  return value
+}
+
 async function authorize(request: Request, env: Env) {
   const header = request.headers.get('authorization') || ''
   const token = header.startsWith('Bearer ') ? header.slice('Bearer '.length).trim() : ''
@@ -131,6 +220,7 @@ async function rowToTemplate(env: Env, request: Request, row: any) {
   const currentVersion = row.current_version_id
     ? await env.DB.prepare('SELECT snapshot_json, version_number FROM template_versions WHERE id = ?').bind(row.current_version_id).first<any>()
     : null
+  const snapshot = currentVersion ? parseJson<TemplateSnapshot | null>(currentVersion.snapshot_json, null) : null
 
   return {
     id: row.id,
@@ -138,14 +228,14 @@ async function rowToTemplate(env: Env, request: Request, row: any) {
     label: parseJson<LocalizedText>(row.label_json, { fr: row.slug, en: row.slug }),
     description: parseJson<LocalizedText>(row.description_json, { fr: '', en: '' }),
     icon: row.icon,
-    previewImage: row.preview_image,
+    previewImage: await normalizeTemplatePreviewImage(env, request, row.preview_image, snapshot),
     highlights: parseJson<LocalizedText[]>(row.highlights_json, []),
     themeNames: parseJson<string[]>(row.theme_names_json, []),
     sourceType: row.source_type,
     deletedAt: row.deleted_at,
     currentVersionId: row.current_version_id,
     currentVersionNumber: currentVersion?.version_number ?? null,
-    snapshot: currentVersion ? parseJson(currentVersion.snapshot_json, null) : null,
+    snapshot,
     versions
   }
 }
@@ -363,8 +453,37 @@ async function createTemplateAsset(request: Request, env: Env) {
     checksum: body.checksum || '',
     storageKey,
     sourceUrl: body.sourceUrl || '',
-    downloadUrl: `${baseUrl(env, request)}/v1/template-assets/${id}/download`
+    downloadUrl: `${baseUrl(env, request)}/v1/template-assets/${id}/download`,
+    publicUrl: templateAssetPublicUrl(env, request, id)
   }, { status: 201 })
+}
+
+async function getTemplateAssetBySource(request: Request, env: Env) {
+  const url = new URL(request.url)
+  const sourceUrl = (url.searchParams.get('sourceUrl') || '').trim()
+  if (!sourceUrl) {
+    return json({ message: 'sourceUrl is required' }, { status: 400 })
+  }
+
+  const row = await env.DB.prepare(
+    'SELECT * FROM template_assets WHERE source_url = ? ORDER BY created_at DESC LIMIT 1'
+  ).bind(sourceUrl).first<any>()
+
+  if (!row) {
+    return json({ message: 'Template asset not found' }, { status: 404 })
+  }
+
+  return json({
+    id: row.id,
+    filename: row.filename,
+    contentType: row.content_type || 'application/octet-stream',
+    size: Number(row.size || 0),
+    checksum: row.checksum || '',
+    storageKey: row.storage_key,
+    sourceUrl: row.source_url || '',
+    downloadUrl: `${baseUrl(env, request)}/v1/template-assets/${encodeURIComponent(row.id)}/download`,
+    publicUrl: templateAssetPublicUrl(env, request, row.id)
+  })
 }
 
 async function downloadTemplateAsset(request: Request, env: Env, id: string) {
@@ -375,6 +494,19 @@ async function downloadTemplateAsset(request: Request, env: Env, id: string) {
   return new Response(object.body, {
     headers: {
       'content-type': row.content_type,
+      'cache-control': 'public, max-age=3600'
+    }
+  })
+}
+
+async function publicTemplateAsset(env: Env, id: string) {
+  const row = await env.DB.prepare('SELECT * FROM template_assets WHERE id = ?').bind(id).first<any>()
+  if (!row) return new Response('Not found', { status: 404 })
+  const object = await env.ASSETS.get(row.storage_key)
+  if (!object) return new Response('Not found', { status: 404 })
+  return new Response(object.body, {
+    headers: {
+      'content-type': row.content_type || 'application/octet-stream',
       'cache-control': 'public, max-age=3600'
     }
   })
@@ -983,10 +1115,20 @@ export default {
         return await createTemplateAsset(request, env)
       }
 
+      if (url.pathname === '/v1/template-assets/by-source' && request.method === 'GET') {
+        await authorize(request, env)
+        return await getTemplateAssetBySource(request, env)
+      }
+
       const templateAssetMatch = url.pathname.match(/^\/v1\/template-assets\/([^/]+)\/download$/)
       if (templateAssetMatch) {
         await authorize(request, env)
         return await downloadTemplateAsset(request, env, templateAssetMatch[1]!)
+      }
+
+      const publicTemplateAssetMatch = url.pathname.match(/^\/public\/template-assets\/([^/]+)$/)
+      if (publicTemplateAssetMatch && request.method === 'GET') {
+        return await publicTemplateAsset(env, decodeURIComponent(publicTemplateAssetMatch[1]!))
       }
 
       if (url.pathname === '/v1/templates' && request.method === 'GET') {
