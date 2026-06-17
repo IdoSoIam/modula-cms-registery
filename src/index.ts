@@ -1,9 +1,9 @@
 export interface Env {
   DB: D1Database
   ASSETS: R2Bucket
-  API_KEYS_JSON?: string
   PUBLIC_BASE_URL?: string
   OWNER_API_KEY?: string
+  CUSTOM_API_KEY?: string
 }
 
 type LocalizedText = { fr: string, en: string }
@@ -24,6 +24,14 @@ type TemplateAssetReference = {
 
 type TemplateSnapshot = {
   assetManifest?: TemplateAssetReference[]
+}
+
+type RegistryCapabilities = {
+  authenticated: boolean
+  canManageSystemTemplates: boolean
+  canManageCustomTemplates: boolean
+  tokenLabel: string | null
+  registryScope: 'system' | 'custom' | 'shared' | null
 }
 
 function json(data: unknown, init: ResponseInit = {}) {
@@ -53,12 +61,49 @@ function newId(prefix: string) {
   return `${prefix}_${crypto.randomUUID()}`
 }
 
-function getApiKeys(env: Env) {
-  return parseJson<Record<string, string>>(env.API_KEYS_JSON, {})
+function getOwnerApiKey(env: Env) {
+  return env.OWNER_API_KEY?.trim() || ''
 }
 
-function getOwnerApiKey(env: Env) {
-  return env.OWNER_API_KEY?.trim() || Object.values(getApiKeys(env))[0] || ''
+function getCustomApiKey(env: Env) {
+  return env.CUSTOM_API_KEY?.trim() || ''
+}
+
+function readBearerToken(request: Request) {
+  const header = request.headers.get('authorization') || ''
+  return header.startsWith('Bearer ') ? header.slice('Bearer '.length).trim() : ''
+}
+
+function getCapabilitiesFromToken(token: string, env: Env): RegistryCapabilities {
+  const ownerToken = getOwnerApiKey(env)
+  if (token && ownerToken && token === ownerToken) {
+    return {
+      authenticated: true,
+      canManageSystemTemplates: true,
+      canManageCustomTemplates: true,
+      tokenLabel: 'owner',
+      registryScope: 'shared'
+    }
+  }
+
+  const customToken = getCustomApiKey(env)
+  if (token && customToken && token === customToken) {
+    return {
+      authenticated: true,
+      canManageSystemTemplates: false,
+      canManageCustomTemplates: true,
+      tokenLabel: 'custom',
+      registryScope: 'custom'
+    }
+  }
+
+  return {
+    authenticated: false,
+    canManageSystemTemplates: false,
+    canManageCustomTemplates: false,
+    tokenLabel: null,
+    registryScope: null
+  }
 }
 
 function parseCookies(request: Request) {
@@ -190,11 +235,24 @@ async function normalizeTemplatePreviewImage(
 }
 
 async function authorize(request: Request, env: Env) {
-  const header = request.headers.get('authorization') || ''
-  const token = header.startsWith('Bearer ') ? header.slice('Bearer '.length).trim() : ''
-  const valid = Object.values(getApiKeys(env)).includes(token)
-  if (!valid) {
+  const capabilities = getCapabilitiesFromToken(readBearerToken(request), env)
+  if (!capabilities.authenticated) {
     throw new Response('Unauthorized', { status: 401 })
+  }
+  return capabilities
+}
+
+function getRequestCapabilities(request: Request, env: Env): RegistryCapabilities {
+  return getCapabilitiesFromToken(readBearerToken(request), env)
+}
+
+function assertTemplateMutationAllowed(capabilities: RegistryCapabilities, sourceType: 'system' | 'custom') {
+  if (sourceType === 'system' && !capabilities.canManageSystemTemplates) {
+    throw json({ message: 'This token cannot manage system templates.' }, { status: 403 })
+  }
+
+  if (sourceType === 'custom' && !capabilities.canManageCustomTemplates) {
+    throw json({ message: 'This token cannot manage custom templates.' }, { status: 403 })
   }
 }
 
@@ -276,53 +334,122 @@ async function getTemplate(request: Request, env: Env, slug: string) {
   return json(await rowToTemplate(env, request, row))
 }
 
-async function createTemplate(request: Request, env: Env) {
+async function createTemplate(request: Request, env: Env, capabilities: RegistryCapabilities) {
   const body = await readJson<any>(request)
   const id = newId('tpl')
   const versionId = newId('tplver')
   const now = nowIso()
   const sourceType = body.sourceType === 'system' ? 'system' : 'custom'
+  assertTemplateMutationAllowed(capabilities, sourceType)
   const labelJson = JSON.stringify(body.label || { fr: body.slug, en: body.slug })
   const descriptionJson = JSON.stringify(body.description || { fr: '', en: '' })
   const icon = body.icon || 'mdi:view-dashboard-edit-outline'
   const previewImage = body.previewImage || ''
   const highlightsJson = JSON.stringify(body.highlights || [])
   const themeNamesJson = JSON.stringify(body.themeNames || [])
+  const existing = await env.DB.prepare('SELECT * FROM templates WHERE slug = ?').bind(body.slug).first<any>()
 
-  await env.DB.batch([
-    env.DB.prepare(
-      `INSERT INTO templates
-      (id, slug, label_json, description_json, icon, preview_image, highlights_json, theme_names_json, source_type, current_version_id, deleted_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
-    ).bind(
-      id,
-      body.slug,
-      labelJson,
-      descriptionJson,
-      icon,
-      previewImage,
-      highlightsJson,
-      themeNamesJson,
-      sourceType,
-      versionId,
-      now,
-      now
-    ),
-    env.DB.prepare(
-      `INSERT INTO template_versions
-      (id, template_id, version_number, status, snapshot_json, label_json, description_json, icon, preview_image, highlights_json, theme_names_json, created_at)
-      VALUES (?, ?, 1, 'published', ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(versionId, id, JSON.stringify(body.snapshot || null), labelJson, descriptionJson, icon, previewImage, highlightsJson, themeNamesJson, now)
-  ])
+  if (existing?.id && !existing.deleted_at) {
+    return json({
+      message: `Template slug "${body.slug}" already exists. Choose another slug.`
+    }, { status: 409 })
+  }
+
+  if (existing?.id && existing.deleted_at) {
+    const versionCount = await env.DB.prepare(
+      'SELECT MAX(version_number) as maxVersion FROM template_versions WHERE template_id = ?'
+    ).bind(existing.id).first<any>()
+    const nextVersion = Number(versionCount?.maxVersion || 0) + 1
+
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO template_versions
+        (id, template_id, version_number, status, snapshot_json, label_json, description_json, icon, preview_image, highlights_json, theme_names_json, created_at)
+        VALUES (?, ?, ?, 'published', ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(
+        versionId,
+        existing.id,
+        nextVersion,
+        JSON.stringify(body.snapshot || null),
+        labelJson,
+        descriptionJson,
+        icon,
+        previewImage,
+        highlightsJson,
+        themeNamesJson,
+        now
+      ),
+      env.DB.prepare(
+        "UPDATE template_versions SET status = 'archived' WHERE template_id = ? AND status = 'published' AND id != ?"
+      ).bind(existing.id, versionId),
+      env.DB.prepare(
+        `UPDATE templates
+         SET label_json = ?, description_json = ?, icon = ?, preview_image = ?, highlights_json = ?, theme_names_json = ?,
+             source_type = ?, current_version_id = ?, deleted_at = NULL, updated_at = ?
+         WHERE id = ?`
+      ).bind(
+        labelJson,
+        descriptionJson,
+        icon,
+        previewImage,
+        highlightsJson,
+        themeNamesJson,
+        sourceType,
+        versionId,
+        now,
+        existing.id
+      )
+    ])
+
+    const restored = await env.DB.prepare('SELECT * FROM templates WHERE id = ?').bind(existing.id).first<any>()
+    return json(await rowToTemplate(env, request, restored), { status: 201 })
+  }
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO templates
+        (id, slug, label_json, description_json, icon, preview_image, highlights_json, theme_names_json, source_type, current_version_id, deleted_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+      ).bind(
+        id,
+        body.slug,
+        labelJson,
+        descriptionJson,
+        icon,
+        previewImage,
+        highlightsJson,
+        themeNamesJson,
+        sourceType,
+        versionId,
+        now,
+        now
+      ),
+      env.DB.prepare(
+        `INSERT INTO template_versions
+        (id, template_id, version_number, status, snapshot_json, label_json, description_json, icon, preview_image, highlights_json, theme_names_json, created_at)
+        VALUES (?, ?, 1, 'published', ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(versionId, id, JSON.stringify(body.snapshot || null), labelJson, descriptionJson, icon, previewImage, highlightsJson, themeNamesJson, now)
+    ])
+  } catch (error: any) {
+    const message = error instanceof Error ? error.message : String(error || '')
+    if (message.includes('UNIQUE constraint failed: templates.slug')) {
+      return json({
+        message: `Template slug "${body.slug}" already exists. Choose another slug.`
+      }, { status: 409 })
+    }
+    throw error
+  }
 
   const row = await env.DB.prepare('SELECT * FROM templates WHERE id = ?').bind(id).first<any>()
   return json(await rowToTemplate(env, request, row), { status: 201 })
 }
 
-async function createTemplateVersion(request: Request, env: Env, slug: string) {
+async function createTemplateVersion(request: Request, env: Env, slug: string, capabilities: RegistryCapabilities) {
   const body = await readJson<any>(request)
   const template = await env.DB.prepare('SELECT * FROM templates WHERE slug = ? AND deleted_at IS NULL').bind(slug).first<any>()
   if (!template) return json({ message: 'Template not found' }, { status: 404 })
+  assertTemplateMutationAllowed(capabilities, template.source_type === 'system' ? 'system' : 'custom')
 
   const versionCount = await env.DB.prepare('SELECT MAX(version_number) as maxVersion FROM template_versions WHERE template_id = ?').bind(template.id).first<any>()
   const nextVersion = Number(versionCount?.maxVersion || 0) + 1
@@ -359,9 +486,10 @@ async function createTemplateVersion(request: Request, env: Env, slug: string) {
   return json(await rowToTemplate(env, request, row))
 }
 
-async function publishTemplateVersion(request: Request, env: Env, slug: string, versionId: string) {
+async function publishTemplateVersion(request: Request, env: Env, slug: string, versionId: string, capabilities: RegistryCapabilities) {
   const template = await env.DB.prepare('SELECT * FROM templates WHERE slug = ? AND deleted_at IS NULL').bind(slug).first<any>()
   if (!template) return json({ message: 'Template not found' }, { status: 404 })
+  assertTemplateMutationAllowed(capabilities, template.source_type === 'system' ? 'system' : 'custom')
   const version = await env.DB.prepare('SELECT * FROM template_versions WHERE id = ? AND template_id = ?').bind(versionId, template.id).first<any>()
   if (!version) return json({ message: 'Version not found' }, { status: 404 })
 
@@ -388,9 +516,10 @@ async function publishTemplateVersion(request: Request, env: Env, slug: string, 
   return json(await rowToTemplate(env, request, row))
 }
 
-async function deleteTemplateVersion(request: Request, env: Env, slug: string, versionId: string) {
+async function deleteTemplateVersion(request: Request, env: Env, slug: string, versionId: string, capabilities: RegistryCapabilities) {
   const template = await env.DB.prepare('SELECT * FROM templates WHERE slug = ? AND deleted_at IS NULL').bind(slug).first<any>()
   if (!template) return json({ message: 'Template not found' }, { status: 404 })
+  assertTemplateMutationAllowed(capabilities, template.source_type === 'system' ? 'system' : 'custom')
 
   const version = await env.DB.prepare('SELECT * FROM template_versions WHERE id = ? AND template_id = ?').bind(versionId, template.id).first<any>()
   if (!version) return json({ message: 'Version not found' }, { status: 404 })
@@ -423,7 +552,10 @@ async function deleteTemplateVersion(request: Request, env: Env, slug: string, v
   return json(await rowToTemplate(env, request, row))
 }
 
-async function deleteTemplate(env: Env, slug: string) {
+async function deleteTemplate(env: Env, slug: string, capabilities: RegistryCapabilities) {
+  const template = await env.DB.prepare('SELECT source_type FROM templates WHERE slug = ? AND deleted_at IS NULL').bind(slug).first<any>()
+  if (!template) return json({ ok: true })
+  assertTemplateMutationAllowed(capabilities, template.source_type === 'system' ? 'system' : 'custom')
   await env.DB.prepare('UPDATE templates SET deleted_at = ?, updated_at = ? WHERE slug = ?').bind(nowIso(), nowIso(), slug).run()
   return json({ ok: true })
 }
@@ -510,6 +642,10 @@ async function publicTemplateAsset(env: Env, id: string) {
       'cache-control': 'public, max-age=3600'
     }
   })
+}
+
+async function introspectAuth(request: Request, env: Env) {
+  return json(getRequestCapabilities(request, env))
 }
 
 async function listReleases(request: Request, env: Env) {
@@ -1116,13 +1252,11 @@ export default {
       }
 
       if (url.pathname === '/v1/template-assets/by-source' && request.method === 'GET') {
-        await authorize(request, env)
         return await getTemplateAssetBySource(request, env)
       }
 
       const templateAssetMatch = url.pathname.match(/^\/v1\/template-assets\/([^/]+)\/download$/)
       if (templateAssetMatch) {
-        await authorize(request, env)
         return await downloadTemplateAsset(request, env, templateAssetMatch[1]!)
       }
 
@@ -1131,45 +1265,46 @@ export default {
         return await publicTemplateAsset(env, decodeURIComponent(publicTemplateAssetMatch[1]!))
       }
 
+      if (url.pathname === '/v1/auth/introspect' && request.method === 'GET') {
+        return await introspectAuth(request, env)
+      }
+
       if (url.pathname === '/v1/templates' && request.method === 'GET') {
-        await authorize(request, env)
         return await listTemplates(request, env)
       }
       if (url.pathname === '/v1/templates' && request.method === 'POST') {
-        await authorize(request, env)
-        return await createTemplate(request, env)
+        const capabilities = await authorize(request, env)
+        return await createTemplate(request, env, capabilities)
       }
 
       const versionMatch = url.pathname.match(/^\/v1\/templates\/([^/]+)\/versions$/)
       if (versionMatch && request.method === 'POST') {
-        await authorize(request, env)
-        return await createTemplateVersion(request, env, decodeURIComponent(versionMatch[1]!))
+        const capabilities = await authorize(request, env)
+        return await createTemplateVersion(request, env, decodeURIComponent(versionMatch[1]!), capabilities)
       }
 
       const deleteVersionMatch = url.pathname.match(/^\/v1\/templates\/([^/]+)\/versions\/([^/]+)$/)
       if (deleteVersionMatch && request.method === 'DELETE') {
-        await authorize(request, env)
-        return await deleteTemplateVersion(request, env, decodeURIComponent(deleteVersionMatch[1]!), decodeURIComponent(deleteVersionMatch[2]!))
+        const capabilities = await authorize(request, env)
+        return await deleteTemplateVersion(request, env, decodeURIComponent(deleteVersionMatch[1]!), decodeURIComponent(deleteVersionMatch[2]!), capabilities)
       }
 
       const publishMatch = url.pathname.match(/^\/v1\/templates\/([^/]+)\/publish\/([^/]+)$/)
       if (publishMatch && request.method === 'POST') {
-        await authorize(request, env)
-        return await publishTemplateVersion(request, env, decodeURIComponent(publishMatch[1]!), decodeURIComponent(publishMatch[2]!))
+        const capabilities = await authorize(request, env)
+        return await publishTemplateVersion(request, env, decodeURIComponent(publishMatch[1]!), decodeURIComponent(publishMatch[2]!), capabilities)
       }
 
       const templateMatch = url.pathname.match(/^\/v1\/templates\/([^/]+)$/)
       if (templateMatch && request.method === 'GET') {
-        await authorize(request, env)
         return await getTemplate(request, env, decodeURIComponent(templateMatch[1]!))
       }
       if (templateMatch && request.method === 'DELETE') {
-        await authorize(request, env)
-        return await deleteTemplate(env, decodeURIComponent(templateMatch[1]!))
+        const capabilities = await authorize(request, env)
+        return await deleteTemplate(env, decodeURIComponent(templateMatch[1]!), capabilities)
       }
 
       if (url.pathname === '/v1/releases' && request.method === 'GET') {
-        await authorize(request, env)
         return await listReleases(request, env)
       }
       if (url.pathname === '/v1/releases' && request.method === 'POST') {
@@ -1179,13 +1314,11 @@ export default {
 
       const releaseArtifactMatch = url.pathname.match(/^\/v1\/releases\/([^/]+)\/artifact$/)
       if (releaseArtifactMatch) {
-        await authorize(request, env)
         return await downloadReleaseArtifact(env, decodeURIComponent(releaseArtifactMatch[1]!))
       }
 
       const releaseMatch = url.pathname.match(/^\/v1\/releases\/([^/]+)$/)
       if (releaseMatch && request.method === 'GET') {
-        await authorize(request, env)
         return await getRelease(request, env, decodeURIComponent(releaseMatch[1]!))
       }
 
