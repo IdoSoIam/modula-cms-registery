@@ -1,9 +1,19 @@
+import { handleGmailSyncModule } from "./modules/gmail-sync"
+import { handleInstancesModule } from "./modules/instances"
+import { handlePaymentsModule } from "./modules/payments"
+import { handleTemplatesModule } from "./modules/templates"
+import { handleUpdateModule } from "./modules/update"
+
 export interface Env {
   DB: D1Database
   ASSETS: R2Bucket
   PUBLIC_BASE_URL?: string
   OWNER_API_KEY?: string
   CUSTOM_API_KEY?: string
+  STRIPE_SECRET_KEY?: string
+  STRIPE_WEBHOOK_SECRET?: string
+  STRIPE_PUBLISHABLE_KEY?: string
+  DEFAULT_COMMISSION_PERCENT?: string
 }
 
 type LocalizedText = { fr: string, en: string }
@@ -32,6 +42,57 @@ type RegistryCapabilities = {
   canManageCustomTemplates: boolean
   tokenLabel: string | null
   registryScope: 'system' | 'custom' | 'shared' | null
+}
+
+type PaymentProvider = 'none' | 'stripe_connect'
+type PaymentStatus = 'UNPAID' | 'PENDING' | 'PAID' | 'FAILED' | 'REFUNDED'
+type PaymentTaxBehavior = 'inclusive' | 'exclusive'
+
+type RegistryPaymentSettings = {
+  provider: PaymentProvider
+  connectedAccountId: string
+  connectedAccountLabel: string
+  automaticTaxEnabled: boolean
+  defaultTaxCode: string
+  defaultTaxBehavior: PaymentTaxBehavior
+  commissionPercent: number
+}
+
+type RegistryPaymentLineItem = {
+  name: string
+  amount: number
+  quantity?: number
+  currency?: string
+  description?: string
+  imageUrl?: string
+  taxBehavior?: PaymentTaxBehavior
+  taxCode?: string
+}
+
+type RegistryPaymentRecord = {
+  id: string
+  instanceSlug: string
+  orderId: string
+  orderNumber: string | null
+  provider: string
+  providerAccountId: string | null
+  providerSessionId: string | null
+  providerPaymentIntentId: string | null
+  providerPaymentStatus: string | null
+  paymentStatus: PaymentStatus
+  checkoutUrl: string | null
+  amountTotal: number
+  currency: string
+  commissionAmount: number
+  commissionPercent: number
+  customerEmail: string | null
+  successUrl: string | null
+  cancelUrl: string | null
+  metadata: Record<string, any>
+  lastEventId: string | null
+  failureReason: string | null
+  createdAt: string
+  updatedAt: string
 }
 
 function json(data: unknown, init: ResponseInit = {}) {
@@ -258,6 +319,226 @@ function assertTemplateMutationAllowed(capabilities: RegistryCapabilities, sourc
 
 async function readJson<T>(request: Request) {
   return await request.json() as T
+}
+
+function normalizePaymentTaxBehavior(value: unknown, fallback: PaymentTaxBehavior = 'inclusive'): PaymentTaxBehavior {
+  return value === 'exclusive' ? 'exclusive' : value === 'inclusive' ? 'inclusive' : fallback
+}
+
+function normalizePaymentSettings(value: unknown): RegistryPaymentSettings {
+  const input = typeof value === 'object' && value ? value as Partial<RegistryPaymentSettings> : {}
+  const commission = Number(input.commissionPercent)
+  const fallbackCommission = Number.parseFloat(String(input.commissionPercent ?? '').trim())
+  const resolvedCommission = Number.isFinite(commission)
+    ? commission
+    : Number.isFinite(fallbackCommission)
+      ? fallbackCommission
+      : 0
+
+  return {
+    provider: input.provider === 'stripe_connect' ? 'stripe_connect' : 'none',
+    connectedAccountId: typeof input.connectedAccountId === 'string' ? input.connectedAccountId.trim() : '',
+    connectedAccountLabel: typeof input.connectedAccountLabel === 'string' ? input.connectedAccountLabel.trim() : '',
+    automaticTaxEnabled: Boolean(input.automaticTaxEnabled),
+    defaultTaxCode: typeof input.defaultTaxCode === 'string' ? input.defaultTaxCode.trim() : '',
+    defaultTaxBehavior: normalizePaymentTaxBehavior(input.defaultTaxBehavior, 'inclusive'),
+    commissionPercent: Math.max(0, Math.min(100, Math.round(resolvedCommission * 100) / 100))
+  }
+}
+
+function getDefaultCommissionPercent(env: Env) {
+  const value = Number.parseFloat((env.DEFAULT_COMMISSION_PERCENT || '').trim())
+  return Number.isFinite(value) ? Math.max(0, Math.min(100, Math.round(value * 100) / 100)) : 0
+}
+
+function getDefaultPaymentSettings(env: Env): RegistryPaymentSettings {
+  return {
+    provider: env.STRIPE_SECRET_KEY?.trim() ? 'stripe_connect' : 'none',
+    connectedAccountId: '',
+    connectedAccountLabel: '',
+    automaticTaxEnabled: true,
+    defaultTaxCode: '',
+    defaultTaxBehavior: 'inclusive',
+    commissionPercent: getDefaultCommissionPercent(env)
+  }
+}
+
+function isStripeConfigured(env: Env) {
+  return Boolean(env.STRIPE_SECRET_KEY?.trim())
+}
+
+function getStripeHeaders(env: Env) {
+  const secret = env.STRIPE_SECRET_KEY?.trim()
+  if (!secret) {
+    throw json({ message: 'Stripe Connect is not configured on this registry.' }, { status: 503 })
+  }
+
+  return {
+    authorization: `Bearer ${secret}`,
+    'content-type': 'application/x-www-form-urlencoded'
+  }
+}
+
+function sanitizeExternalImageUrl(value: unknown) {
+  if (typeof value !== 'string' || !value.trim()) return ''
+  try {
+    const url = new URL(value.trim())
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return ''
+    const hostname = url.hostname.toLowerCase()
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname.endsWith('.local')) {
+      return ''
+    }
+    return url.toString()
+  } catch {
+    return ''
+  }
+}
+
+function normalizeCurrency(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value.trim().toLowerCase() : 'eur'
+}
+
+function normalizeIntegerAmount(value: unknown) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : 0
+}
+
+function appendStripeParam(params: URLSearchParams, key: string, value: unknown) {
+  if (value == null) return
+  if (typeof value === 'string') {
+    if (!value.trim()) return
+    params.set(key, value)
+    return
+  }
+  params.set(key, String(value))
+}
+
+async function stripeRequest<T>(env: Env, path: string, params: URLSearchParams) {
+  const response = await fetch(`https://api.stripe.com${path}`, {
+    method: 'POST',
+    headers: getStripeHeaders(env),
+    body: params.toString()
+  })
+
+  const payload = await response.json<any>()
+  if (!response.ok) {
+    throw json({
+      message: payload?.error?.message || 'Stripe request failed.',
+      stripeError: payload?.error || null
+    }, { status: response.status })
+  }
+
+  return payload as T
+}
+
+function stripeHexToBytes(value: string) {
+  if (!value || value.length % 2 !== 0) return null
+  const bytes = new Uint8Array(value.length / 2)
+  for (let index = 0; index < value.length; index += 2) {
+    const byte = Number.parseInt(value.slice(index, index + 2), 16)
+    if (!Number.isFinite(byte)) return null
+    bytes[index / 2] = byte
+  }
+  return bytes
+}
+
+function timingSafeEqual(left: Uint8Array, right: Uint8Array) {
+  if (left.length !== right.length) return false
+  let diff = 0
+  for (let index = 0; index < left.length; index += 1) {
+    diff |= left[index]! ^ right[index]!
+  }
+  return diff === 0
+}
+
+async function stripeWebhookEvent(env: Env, rawBody: string, signature: string) {
+  const secret = env.STRIPE_WEBHOOK_SECRET?.trim()
+  if (!secret) {
+    throw json({ message: 'Stripe webhook secret is not configured on this registry.' }, { status: 503 })
+  }
+
+  const parts = signature.split(',').map(part => part.trim()).filter(Boolean)
+  const timestamp = parts.find(part => part.startsWith('t='))?.slice(2) || ''
+  const signatures = parts.filter(part => part.startsWith('v1=')).map(part => part.slice(3)).filter(Boolean)
+  if (!timestamp || !signatures.length) {
+    throw json({ message: 'Invalid Stripe signature header.' }, { status: 400 })
+  }
+
+  const signedPayload = `${timestamp}.${rawBody}`
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+  const digest = new Uint8Array(await crypto.subtle.sign('HMAC', cryptoKey, new TextEncoder().encode(signedPayload)))
+  const matched = signatures.some((candidate) => {
+    const bytes = stripeHexToBytes(candidate)
+    return bytes ? timingSafeEqual(digest, bytes) : false
+  })
+
+  if (!matched) {
+    throw json({ message: 'Invalid Stripe webhook signature.' }, { status: 400 })
+  }
+
+  return JSON.parse(rawBody) as any
+}
+
+function parseInstancePaymentSettings(row: any, env: Env) {
+  return normalizePaymentSettings(row?.payment_settings_json ? parseJson(row.payment_settings_json, {}) : getDefaultPaymentSettings(env))
+}
+
+function decorateInstance(row: any, env: Env) {
+  const paymentSettings = parseInstancePaymentSettings(row, env)
+  return {
+    id: row.id,
+    slug: row.slug,
+    name: row.name,
+    environment: row.environment,
+    releaseChannel: row.release_channel,
+    currentVersion: row.current_version,
+    lastSeenAt: row.last_seen_at,
+    payment: {
+      provider: paymentSettings.provider,
+      configured: paymentSettings.provider === 'stripe_connect' && Boolean(paymentSettings.connectedAccountId) && isStripeConfigured(env),
+      connectedAccountId: paymentSettings.connectedAccountId,
+      connectedAccountLabel: paymentSettings.connectedAccountLabel,
+      automaticTaxEnabled: paymentSettings.automaticTaxEnabled,
+      defaultTaxCode: paymentSettings.defaultTaxCode,
+      defaultTaxBehavior: paymentSettings.defaultTaxBehavior,
+      commissionPercent: paymentSettings.commissionPercent,
+      publishableKey: env.STRIPE_PUBLISHABLE_KEY?.trim() || ''
+    }
+  }
+}
+
+function paymentRowToRecord(row: any): RegistryPaymentRecord {
+  return {
+    id: row.id,
+    instanceSlug: row.instance_slug,
+    orderId: row.order_id,
+    orderNumber: row.order_number ?? null,
+    provider: row.provider,
+    providerAccountId: row.provider_account_id ?? null,
+    providerSessionId: row.provider_session_id ?? null,
+    providerPaymentIntentId: row.provider_payment_intent_id ?? null,
+    providerPaymentStatus: row.provider_payment_status ?? null,
+    paymentStatus: row.payment_status,
+    checkoutUrl: row.checkout_url ?? null,
+    amountTotal: Number(row.amount_total || 0),
+    currency: row.currency || 'eur',
+    commissionAmount: Number(row.commission_amount || 0),
+    commissionPercent: Number(row.commission_percent || 0),
+    customerEmail: row.customer_email ?? null,
+    successUrl: row.success_url ?? null,
+    cancelUrl: row.cancel_url ?? null,
+    metadata: parseJson(row.metadata_json, {}),
+    lastEventId: row.last_event_id ?? null,
+    failureReason: row.failure_reason ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  }
 }
 
 async function listTemplateVersions(env: Env, templateId: string) {
@@ -716,24 +997,390 @@ async function registerInstance(request: Request, env: Env) {
   const body = await readJson<any>(request)
   const now = nowIso()
   const existing = await env.DB.prepare('SELECT * FROM instances WHERE slug = ?').bind(body.slug).first<any>()
+  const paymentSettings = normalizePaymentSettings(body.payment || {})
   if (existing) {
     await env.DB.prepare(
-      'UPDATE instances SET name = ?, environment = ?, release_channel = ?, last_seen_at = ?, updated_at = ? WHERE slug = ?'
-    ).bind(body.name, body.environment || 'development', body.releaseChannel || 'stable', now, now, body.slug).run()
+      'UPDATE instances SET name = ?, environment = ?, release_channel = ?, payment_provider = ?, payment_settings_json = ?, last_seen_at = ?, updated_at = ? WHERE slug = ?'
+    ).bind(
+      body.name,
+      body.environment || 'development',
+      body.releaseChannel || 'stable',
+      paymentSettings.provider,
+      JSON.stringify(paymentSettings),
+      now,
+      now,
+      body.slug
+    ).run()
   } else {
     await env.DB.prepare(
-      'INSERT INTO instances (id, slug, name, environment, release_channel, current_version, last_seen_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)'
-    ).bind(newId('inst'), body.slug, body.name, body.environment || 'development', body.releaseChannel || 'stable', now, now, now).run()
+      'INSERT INTO instances (id, slug, name, environment, release_channel, current_version, payment_provider, payment_settings_json, last_seen_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)'
+    ).bind(
+      newId('inst'),
+      body.slug,
+      body.name,
+      body.environment || 'development',
+      body.releaseChannel || 'stable',
+      paymentSettings.provider,
+      JSON.stringify(paymentSettings),
+      now,
+      now,
+      now
+    ).run()
   }
   const row = await env.DB.prepare('SELECT * FROM instances WHERE slug = ?').bind(body.slug).first<any>()
+  return json(decorateInstance(row, env))
+}
+
+async function getInstanceBySlug(env: Env, slug: string) {
+  const row = await env.DB.prepare('SELECT * FROM instances WHERE slug = ?').bind(slug).first<any>()
+  if (!row) {
+    throw json({ message: `Instance "${slug}" is not registered.` }, { status: 404 })
+  }
+  return row
+}
+
+async function ensureInstanceExists(env: Env, slug: string) {
+  const existing = await env.DB.prepare('SELECT * FROM instances WHERE slug = ?').bind(slug).first<any>()
+  if (existing) return existing
+  const now = nowIso()
+  await env.DB.prepare(
+    'INSERT INTO instances (id, slug, name, environment, release_channel, current_version, payment_provider, payment_settings_json, last_seen_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)'
+  ).bind(
+    newId('inst'),
+    slug,
+    slug,
+    'unknown',
+    'stable',
+    'none',
+    JSON.stringify(getDefaultPaymentSettings(env)),
+    now,
+    now,
+    now
+  ).run()
+  return await env.DB.prepare('SELECT * FROM instances WHERE slug = ?').bind(slug).first<any>()
+}
+
+function getInstanceSlugFromRequest(request: Request) {
+  return (request.headers.get('x-instance-slug') || new URL(request.url).searchParams.get('instanceSlug') || '').trim()
+}
+
+async function getInstancePaymentConfig(request: Request, env: Env) {
+  const instanceSlug = getInstanceSlugFromRequest(request)
+  if (!instanceSlug) {
+    return json({ message: 'Instance slug is required.' }, { status: 400 })
+  }
+
+  const row = await ensureInstanceExists(env, instanceSlug)
+  return json(decorateInstance(row, env).payment)
+}
+
+async function updateInstancePaymentConfig(request: Request, env: Env) {
+  await authorize(request, env)
+  const instanceSlug = getInstanceSlugFromRequest(request)
+  if (!instanceSlug) {
+    return json({ message: 'Instance slug is required.' }, { status: 400 })
+  }
+
+  const row = await ensureInstanceExists(env, instanceSlug)
+  const body = await readJson<any>(request)
+  const mergedSettings = normalizePaymentSettings({
+    ...parseInstancePaymentSettings(row, env),
+    ...(body || {})
+  })
+  const now = nowIso()
+
+  await env.DB.prepare(
+    'UPDATE instances SET payment_provider = ?, payment_settings_json = ?, updated_at = ? WHERE slug = ?'
+  ).bind(
+    mergedSettings.provider,
+    JSON.stringify(mergedSettings),
+    now,
+    instanceSlug
+  ).run()
+
+  const updated = await getInstanceBySlug(env, instanceSlug)
+  return json(decorateInstance(updated, env).payment)
+}
+
+async function getPaymentByOrder(env: Env, instanceSlug: string, orderId: string) {
+  const row = await env.DB.prepare(
+    'SELECT * FROM payments WHERE instance_slug = ? AND order_id = ?'
+  ).bind(instanceSlug, orderId).first<any>()
+  return row ? paymentRowToRecord(row) : null
+}
+
+async function getPaymentBySession(env: Env, providerSessionId: string) {
+  const row = await env.DB.prepare(
+    'SELECT * FROM payments WHERE provider_session_id = ?'
+  ).bind(providerSessionId).first<any>()
+  return row ? paymentRowToRecord(row) : null
+}
+
+async function persistPaymentRecord(env: Env, record: Partial<RegistryPaymentRecord> & { id: string, instanceSlug: string, orderId: string, provider: string }) {
+  const now = nowIso()
+  const existing = await env.DB.prepare('SELECT id, created_at FROM payments WHERE id = ?').bind(record.id).first<any>()
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO payments (
+      id, instance_slug, order_id, order_number, provider, provider_account_id, provider_session_id,
+      provider_payment_intent_id, provider_payment_status, payment_status, checkout_url, amount_total,
+      currency, commission_amount, commission_percent, customer_email, success_url, cancel_url,
+      metadata_json, last_event_id, failure_reason, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    record.id,
+    record.instanceSlug,
+    record.orderId,
+    record.orderNumber || null,
+    record.provider,
+    record.providerAccountId || null,
+    record.providerSessionId || null,
+    record.providerPaymentIntentId || null,
+    record.providerPaymentStatus || null,
+    record.paymentStatus || 'PENDING',
+    record.checkoutUrl || null,
+    normalizeIntegerAmount(record.amountTotal),
+    normalizeCurrency(record.currency),
+    normalizeIntegerAmount(record.commissionAmount),
+    Number(record.commissionPercent || 0),
+    record.customerEmail || null,
+    record.successUrl || null,
+    record.cancelUrl || null,
+    JSON.stringify(record.metadata || {}),
+    record.lastEventId || null,
+    record.failureReason || null,
+    existing?.created_at || now,
+    now
+  ).run()
+
+  const row = await env.DB.prepare('SELECT * FROM payments WHERE id = ?').bind(record.id).first<any>()
+  return paymentRowToRecord(row)
+}
+
+async function createStripeConnectCheckout(request: Request, env: Env) {
+  await authorize(request, env)
+  const instanceSlug = getInstanceSlugFromRequest(request)
+  if (!instanceSlug) {
+    return json({ message: 'Instance slug is required.' }, { status: 400 })
+  }
+
+  const instance = await getInstanceBySlug(env, instanceSlug)
+  const paymentSettings = parseInstancePaymentSettings(instance, env)
+  if (paymentSettings.provider !== 'stripe_connect' || !paymentSettings.connectedAccountId) {
+    return json({ message: 'Stripe Connect is not configured for this instance.' }, { status: 400 })
+  }
+  if (!isStripeConfigured(env)) {
+    return json({ message: 'Stripe Connect is not configured on this registry.' }, { status: 503 })
+  }
+
+  const body = await readJson<{
+    orderId: string
+    orderNumber?: string
+    successUrl: string
+    cancelUrl: string
+    customerEmail?: string
+    currency?: string
+    metadata?: Record<string, string>
+    lineItems?: RegistryPaymentLineItem[]
+  }>(request)
+
+  if (!body.orderId?.trim() || !body.successUrl?.trim() || !body.cancelUrl?.trim()) {
+    return json({ message: 'orderId, successUrl and cancelUrl are required.' }, { status: 400 })
+  }
+
+  const lineItems = Array.isArray(body.lineItems) ? body.lineItems : []
+  if (!lineItems.length) {
+    return json({ message: 'At least one line item is required.' }, { status: 400 })
+  }
+
+  const currency = normalizeCurrency(body.currency)
+  const amountTotal = lineItems.reduce((sum, item) => sum + normalizeIntegerAmount(item.amount) * Math.max(1, Math.round(Number(item.quantity || 1))), 0)
+  const commissionPercent = paymentSettings.commissionPercent
+  const commissionAmount = Math.max(0, Math.round(amountTotal * (commissionPercent / 100)))
+  const params = new URLSearchParams()
+  appendStripeParam(params, 'mode', 'payment')
+  appendStripeParam(params, 'success_url', body.successUrl.trim())
+  appendStripeParam(params, 'cancel_url', body.cancelUrl.trim())
+  appendStripeParam(params, 'customer_email', body.customerEmail?.trim() || '')
+  appendStripeParam(params, 'payment_intent_data[application_fee_amount]', commissionAmount)
+  appendStripeParam(params, 'payment_intent_data[transfer_data][destination]', paymentSettings.connectedAccountId)
+  appendStripeParam(params, 'metadata[instanceSlug]', instanceSlug)
+  appendStripeParam(params, 'metadata[orderId]', body.orderId.trim())
+  appendStripeParam(params, 'metadata[orderNumber]', body.orderNumber?.trim() || '')
+  if (paymentSettings.automaticTaxEnabled) {
+    appendStripeParam(params, 'automatic_tax[enabled]', 'true')
+  }
+
+  Object.entries(body.metadata || {}).forEach(([key, value]) => appendStripeParam(params, `metadata[${key}]`, value))
+
+  lineItems.forEach((item, index) => {
+    const quantity = Math.max(1, Math.round(Number(item.quantity || 1)))
+    const imageUrl = sanitizeExternalImageUrl(item.imageUrl)
+    appendStripeParam(params, `line_items[${index}][quantity]`, quantity)
+    appendStripeParam(params, `line_items[${index}][price_data][currency]`, currency)
+    appendStripeParam(params, `line_items[${index}][price_data][unit_amount]`, normalizeIntegerAmount(item.amount))
+    if (paymentSettings.automaticTaxEnabled) {
+      appendStripeParam(
+        params,
+        `line_items[${index}][price_data][tax_behavior]`,
+        normalizePaymentTaxBehavior(item.taxBehavior, paymentSettings.defaultTaxBehavior)
+      )
+      appendStripeParam(
+        params,
+        `line_items[${index}][price_data][product_data][tax_code]`,
+        typeof item.taxCode === 'string' && item.taxCode.trim() ? item.taxCode.trim() : paymentSettings.defaultTaxCode
+      )
+    }
+    appendStripeParam(params, `line_items[${index}][price_data][product_data][name]`, item.name)
+    appendStripeParam(params, `line_items[${index}][price_data][product_data][description]`, item.description || '')
+    appendStripeParam(params, `line_items[${index}][price_data][product_data][images][0]`, imageUrl)
+  })
+
+  const stripeSession = await stripeRequest<any>(env, '/v1/checkout/sessions', params)
+  const payment = await persistPaymentRecord(env, {
+    id: newId('pay'),
+    instanceSlug,
+    orderId: body.orderId.trim(),
+    orderNumber: body.orderNumber?.trim() || null,
+    provider: 'stripe_connect',
+    providerAccountId: paymentSettings.connectedAccountId,
+    providerSessionId: stripeSession.id || null,
+    providerPaymentIntentId: typeof stripeSession.payment_intent === 'string'
+      ? stripeSession.payment_intent
+      : stripeSession.payment_intent?.id || null,
+    providerPaymentStatus: stripeSession.payment_status || null,
+    paymentStatus: stripeSession.payment_status === 'paid' ? 'PAID' : 'PENDING',
+    checkoutUrl: stripeSession.url || null,
+    amountTotal,
+    currency,
+    commissionAmount,
+    commissionPercent,
+    customerEmail: body.customerEmail?.trim() || null,
+    successUrl: body.successUrl.trim(),
+    cancelUrl: body.cancelUrl.trim(),
+    metadata: body.metadata || {}
+  })
+
+  return json(payment)
+}
+
+async function getPaymentStatusBySession(request: Request, env: Env, sessionId: string) {
+  await authorize(request, env)
+  const payment = await getPaymentBySession(env, sessionId)
+  if (!payment) return json({ message: 'Payment session not found.' }, { status: 404 })
+  return json(payment)
+}
+
+async function getPaymentStatusByOrder(request: Request, env: Env, orderId: string) {
+  await authorize(request, env)
+  const instanceSlug = getInstanceSlugFromRequest(request)
+  if (!instanceSlug) {
+    return json({ message: 'Instance slug is required.' }, { status: 400 })
+  }
+  const payment = await getPaymentByOrder(env, instanceSlug, orderId)
+  if (!payment) return json({ message: 'Payment not found.' }, { status: 404 })
+  return json(payment)
+}
+
+async function syncStripePaymentRecord(env: Env, payload: any) {
+  const eventType = String(payload?.type || '')
+  const eventId = String(payload?.id || '')
+  const object = payload?.data?.object || {}
+
+  if (eventType.startsWith('checkout.session.')) {
+    const providerSessionId = typeof object.id === 'string' ? object.id : ''
+    if (!providerSessionId) return null
+    const payment = await getPaymentBySession(env, providerSessionId)
+    if (!payment) return null
+
+    return await persistPaymentRecord(env, {
+      ...payment,
+      id: payment.id,
+      instanceSlug: payment.instanceSlug,
+      orderId: payment.orderId,
+      provider: payment.provider,
+      providerSessionId,
+      providerPaymentIntentId: typeof object.payment_intent === 'string' ? object.payment_intent : payment.providerPaymentIntentId,
+      providerPaymentStatus: object.payment_status || payment.providerPaymentStatus,
+      paymentStatus: object.payment_status === 'paid'
+        ? 'PAID'
+        : eventType === 'checkout.session.expired' || eventType === 'checkout.session.async_payment_failed'
+          ? 'FAILED'
+          : 'PENDING',
+      checkoutUrl: object.url || payment.checkoutUrl,
+      lastEventId: eventId,
+      failureReason: eventType === 'checkout.session.async_payment_failed'
+        ? 'async_payment_failed'
+        : eventType === 'checkout.session.expired'
+          ? 'checkout_session_expired'
+          : payment.failureReason,
+      metadata: {
+        ...payment.metadata,
+        stripeCheckoutStatus: object.status || null
+      }
+    })
+  }
+
+  if (eventType.startsWith('payment_intent.')) {
+    const providerPaymentIntentId = typeof object.id === 'string' ? object.id : ''
+    if (!providerPaymentIntentId) return null
+    const row = await env.DB.prepare('SELECT * FROM payments WHERE provider_payment_intent_id = ?').bind(providerPaymentIntentId).first<any>()
+    if (!row) return null
+    const payment = paymentRowToRecord(row)
+    return await persistPaymentRecord(env, {
+      ...payment,
+      id: payment.id,
+      instanceSlug: payment.instanceSlug,
+      orderId: payment.orderId,
+      provider: payment.provider,
+      providerPaymentIntentId,
+      providerPaymentStatus: object.status || payment.providerPaymentStatus,
+      paymentStatus: eventType === 'payment_intent.succeeded'
+        ? 'PAID'
+        : eventType === 'payment_intent.payment_failed' || eventType === 'payment_intent.canceled'
+          ? 'FAILED'
+          : payment.paymentStatus,
+      lastEventId: eventId,
+      failureReason: object.last_payment_error?.message || payment.failureReason
+    })
+  }
+
+  if (eventType === 'charge.refunded') {
+    const paymentIntentId = typeof object.payment_intent === 'string'
+      ? object.payment_intent
+      : object.payment_intent?.id || ''
+    if (!paymentIntentId) return null
+    const row = await env.DB.prepare('SELECT * FROM payments WHERE provider_payment_intent_id = ?').bind(paymentIntentId).first<any>()
+    if (!row) return null
+    const payment = paymentRowToRecord(row)
+    return await persistPaymentRecord(env, {
+      ...payment,
+      id: payment.id,
+      instanceSlug: payment.instanceSlug,
+      orderId: payment.orderId,
+      provider: payment.provider,
+      paymentStatus: 'REFUNDED',
+      providerPaymentStatus: 'refunded',
+      lastEventId: eventId,
+      failureReason: null
+    })
+  }
+
+  return null
+}
+
+async function handleStripeWebhook(request: Request, env: Env) {
+  const signature = request.headers.get('stripe-signature') || ''
+  if (!signature) {
+    return json({ message: 'Stripe-Signature header is required.' }, { status: 400 })
+  }
+  const rawBody = await request.text()
+  const event = await stripeWebhookEvent(env, rawBody, signature)
+  const payment = await syncStripePaymentRecord(env, event)
   return json({
-    id: row.id,
-    slug: row.slug,
-    name: row.name,
-    environment: row.environment,
-    releaseChannel: row.release_channel,
-    currentVersion: row.current_version,
-    lastSeenAt: row.last_seen_at
+    ok: true,
+    eventId: event?.id || null,
+    eventType: event?.type || null,
+    payment
   })
 }
 
@@ -1228,124 +1875,70 @@ export default {
         })
       }
 
-      if (url.pathname === '/admin/api/templates' && request.method === 'GET') {
-        return await adminListTemplates(request, env)
-      }
+      const templatesResponse = await handleTemplatesModule(
+        { request, url, env },
+        {
+          adminListTemplates,
+          adminUpdateTemplateMeta,
+          introspectAuth,
+          createTemplateAsset,
+          getTemplateAssetBySource,
+          downloadTemplateAsset,
+          publicTemplateAsset,
+          authorize,
+          listTemplates,
+          createTemplate,
+          createTemplateVersion,
+          deleteTemplateVersion,
+          publishTemplateVersion,
+          getTemplate,
+          deleteTemplate
+        }
+      )
+      if (templatesResponse) return templatesResponse
 
-      const adminTemplateMetaMatch = url.pathname.match(/^\/admin\/api\/templates\/([^/]+)\/meta$/)
-      if (adminTemplateMetaMatch && request.method === 'PATCH') {
-        return await adminUpdateTemplateMeta(request, env, decodeURIComponent(adminTemplateMetaMatch[1]!))
-      }
+      const updateResponse = await handleUpdateModule(
+        { request, url, env },
+        {
+          adminListReleases,
+          adminUpdateReleaseMeta,
+          authorize,
+          listReleases,
+          createRelease,
+          downloadReleaseArtifact,
+          getRelease,
+          createDeployment,
+          updateDeployment,
+          listDeployments,
+          getDeployment
+        }
+      )
+      if (updateResponse) return updateResponse
 
-      if (url.pathname === '/admin/api/releases' && request.method === 'GET') {
-        return await adminListReleases(request, env)
-      }
+      const instancesResponse = await handleInstancesModule(
+        { request, url, env },
+        {
+          authorize,
+          registerInstance
+        }
+      )
+      if (instancesResponse) return instancesResponse
 
-      const adminReleaseMetaMatch = url.pathname.match(/^\/admin\/api\/releases\/([^/]+)\/meta$/)
-      if (adminReleaseMetaMatch && request.method === 'PATCH') {
-        return await adminUpdateReleaseMeta(request, env, decodeURIComponent(adminReleaseMetaMatch[1]!))
-      }
+      const paymentsResponse = await handlePaymentsModule(
+        { request, url, env },
+        {
+          getInstancePaymentConfig,
+          updateInstancePaymentConfig,
+          createStripeConnectCheckout,
+          getPaymentStatusBySession,
+          getPaymentStatusByOrder,
+          handleStripeWebhook
+        }
+      )
+      if (paymentsResponse) return paymentsResponse
 
-      if (url.pathname === '/v1/template-assets' && request.method === 'POST') {
-        await authorize(request, env)
-        return await createTemplateAsset(request, env)
-      }
-
-      if (url.pathname === '/v1/template-assets/by-source' && request.method === 'GET') {
-        return await getTemplateAssetBySource(request, env)
-      }
-
-      const templateAssetMatch = url.pathname.match(/^\/v1\/template-assets\/([^/]+)\/download$/)
-      if (templateAssetMatch) {
-        return await downloadTemplateAsset(request, env, templateAssetMatch[1]!)
-      }
-
-      const publicTemplateAssetMatch = url.pathname.match(/^\/public\/template-assets\/([^/]+)$/)
-      if (publicTemplateAssetMatch && request.method === 'GET') {
-        return await publicTemplateAsset(env, decodeURIComponent(publicTemplateAssetMatch[1]!))
-      }
-
-      if (url.pathname === '/v1/auth/introspect' && request.method === 'GET') {
-        return await introspectAuth(request, env)
-      }
-
-      if (url.pathname === '/v1/templates' && request.method === 'GET') {
-        return await listTemplates(request, env)
-      }
-      if (url.pathname === '/v1/templates' && request.method === 'POST') {
-        const capabilities = await authorize(request, env)
-        return await createTemplate(request, env, capabilities)
-      }
-
-      const versionMatch = url.pathname.match(/^\/v1\/templates\/([^/]+)\/versions$/)
-      if (versionMatch && request.method === 'POST') {
-        const capabilities = await authorize(request, env)
-        return await createTemplateVersion(request, env, decodeURIComponent(versionMatch[1]!), capabilities)
-      }
-
-      const deleteVersionMatch = url.pathname.match(/^\/v1\/templates\/([^/]+)\/versions\/([^/]+)$/)
-      if (deleteVersionMatch && request.method === 'DELETE') {
-        const capabilities = await authorize(request, env)
-        return await deleteTemplateVersion(request, env, decodeURIComponent(deleteVersionMatch[1]!), decodeURIComponent(deleteVersionMatch[2]!), capabilities)
-      }
-
-      const publishMatch = url.pathname.match(/^\/v1\/templates\/([^/]+)\/publish\/([^/]+)$/)
-      if (publishMatch && request.method === 'POST') {
-        const capabilities = await authorize(request, env)
-        return await publishTemplateVersion(request, env, decodeURIComponent(publishMatch[1]!), decodeURIComponent(publishMatch[2]!), capabilities)
-      }
-
-      const templateMatch = url.pathname.match(/^\/v1\/templates\/([^/]+)$/)
-      if (templateMatch && request.method === 'GET') {
-        return await getTemplate(request, env, decodeURIComponent(templateMatch[1]!))
-      }
-      if (templateMatch && request.method === 'DELETE') {
-        const capabilities = await authorize(request, env)
-        return await deleteTemplate(env, decodeURIComponent(templateMatch[1]!), capabilities)
-      }
-
-      if (url.pathname === '/v1/releases' && request.method === 'GET') {
-        return await listReleases(request, env)
-      }
-      if (url.pathname === '/v1/releases' && request.method === 'POST') {
-        await authorize(request, env)
-        return await createRelease(request, env)
-      }
-
-      const releaseArtifactMatch = url.pathname.match(/^\/v1\/releases\/([^/]+)\/artifact$/)
-      if (releaseArtifactMatch) {
-        return await downloadReleaseArtifact(env, decodeURIComponent(releaseArtifactMatch[1]!))
-      }
-
-      const releaseMatch = url.pathname.match(/^\/v1\/releases\/([^/]+)$/)
-      if (releaseMatch && request.method === 'GET') {
-        return await getRelease(request, env, decodeURIComponent(releaseMatch[1]!))
-      }
-
-      if (url.pathname === '/v1/instances/register' && request.method === 'POST') {
-        await authorize(request, env)
-        return await registerInstance(request, env)
-      }
-
-      if (url.pathname === '/v1/deployments' && request.method === 'POST') {
-        await authorize(request, env)
-        return await createDeployment(request, env)
-      }
-
-      if (url.pathname === '/v1/deployments' && request.method === 'GET') {
-        await authorize(request, env)
-        return await listDeployments(request, env)
-      }
-
-      const deploymentMatch = url.pathname.match(/^\/v1\/deployments\/([^/]+)$/)
-      if (deploymentMatch && request.method === 'GET') {
-        await authorize(request, env)
-        return await getDeployment(env, decodeURIComponent(deploymentMatch[1]!))
-      }
-      if (deploymentMatch && request.method === 'PATCH') {
-        await authorize(request, env)
-        return await updateDeployment(request, env, decodeURIComponent(deploymentMatch[1]!))
-      }
+      const gmailSyncResponse = await handleGmailSyncModule({ request, url, env })
+      if (gmailSyncResponse) return gmailSyncResponse
 
       return new Response('Not found', { status: 404 })
     } catch (error) {
