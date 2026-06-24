@@ -18,6 +18,8 @@
 		}
 	],
 	"vars": {
-		"OWNER_API_KEY": "fNaOYWeJhdUa9tM0ENZz"
+		"PUBLIC_BASE_URL": "https://modula-cms-registry.shiny-meadow-56d0.workers.dev",
+		"DEFAULT_COMMISSION_PERCENT": "2",
+		"STRIPE_PUBLISHABLE_KEY": "pk_test_51ThAE9LMmpCld6aE64KqaxIRrP3rF4LIsHQFgPM5XaUsmr0p0HPIKHsPEF7ePPx1HEvqNXlOxEY6Pac7fcCPO9oY00rO6JPzjs"
 	}
 }
